@@ -1,4 +1,4 @@
-# sql-agent
+# sql-agent - parser.py
 
 Tail the logs from a specific directory and can output them to file in JSON format.
 
@@ -27,3 +27,7 @@ WantedBy=multi-user.target
 4. systemctl daemon-reload
 5. systemctl enable sql-parser.service
 6. systemctl start sql-parser.service
+
+
+# generator.py
+1. This is an example log generator that adds random log from the three every second to logs.txt file declared.
