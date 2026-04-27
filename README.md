@@ -14,7 +14,6 @@ Description=MySQL Slow Log Parser Agent
 After=network.target
 
 [Service]
-# Replace 'tadas' with your actual username if different
 User=root
 WorkingDirectory=/home/tadas/Dev/SQL-parser
 ExecStart=/usr/bin/python3 /parser.py
