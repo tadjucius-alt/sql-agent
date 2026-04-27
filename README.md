@@ -30,4 +30,4 @@ WantedBy=multi-user.target
 
 
 # generator.py
-1. This is an example log generator that adds random log from the three every second to logs.txt file declared.
+1. This is an example log generator that adds random log from the example three logs every second to logs.txt file declared.
