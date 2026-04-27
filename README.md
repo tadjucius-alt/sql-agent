@@ -8,7 +8,8 @@ Tail the logs from a specific directory and can output them to file in JSON form
         OUT_FILE = "/home/tadas/Dev/SQL-parser/output.json"
 3. Enable systemd service for the script to constantly run and tail the log entries.
   3.1. vim /etc/systemd/system/sql-parser.service
-  3.2. paste 
+  3.2. paste
+
 [Unit]
 Description=MySQL Slow Log Parser Agent
 After=network.target
