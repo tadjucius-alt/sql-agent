@@ -1,178 +1,149 @@
 #!/usr/bin/env python3
-import re
-import json
-import time
-import os
-import sys
+import re, json, time, os, requests
 
-# --- 1. CONFIG & STATE TRACKING ---
-# This file saves our "bookmark" so we don't parse the same lines twice
+# --- CONFIG ---
 STATE_FILE = "/home/tadas/Dev/SQL-parser/parser_state.json"
+ES_URL = "http://localhost:9200/sql-slowlog/_doc"
 
-def get_last_state():
-    """Reads the saved bookmark (inode and byte position)"""
-    if os.path.exists(STATE_FILE):
-        with open(STATE_FILE, 'r') as f:
-            return json.load(f)
-    return {"inode": 0, "pos": 0}
-
-def save_state(inode, pos):
-    """Saves the current position to the bookmark file"""
-    with open(STATE_FILE, 'w') as f:
-        json.dump({"inode": inode, "pos": pos}, f)
-
-# --- 2. FLOAT PRECISION TOOLS ---
-class PreciseJSONEncoder(json.JSONEncoder):
+# --- TOOLS ---
+# PreciseEncoder: Forces Python to write small decimals fully (0.000031) instead of scientific notation (3.1e-05)
+class PreciseEncoder(json.JSONEncoder):
     def default(self, obj):
         if isinstance(obj, float):
             return format(obj, '.12f').rstrip('0').rstrip('.')
         return super().default(obj)
 
-# --- 3. THE PARSER ---
 def parse_query_block(block):
+    """Parses a single block of log text into a clean JSON dictionary"""
     if not block.strip(): return None
-    entry = {
-        'Time': None, 'User@Host': None, 'Id': None, 'Schema': None, 'Last_errno': 0, 'Killed': 0,
-        'Query_time': 0.0, 'Lock_time': 0.0, 'Rows_sent': 0, 'Rows_examined': 0, 'Rows_affected': 0,
-        'Bytes_sent': 0, 'Tmp_tables': 0, 'Tmp_disk_tables': 0, 'Tmp_table_sizes': 0,
-        'QC_Hit': None, 'Full_scan': None, 'Full_join': None, 'Tmp_table': None, 'Tmp_table_on_disk': None,
-        'Filesort': None, 'Filesort_on_disk': None, 'Merge_passes': 0,
-        'InnoDB_IO_r_ops': 0, 'InnoDB_IO_r_bytes': 0, 'InnoDB_IO_r_wait': 0.0,
-        'InnoDB_rec_lock_wait': 0.0, 'InnoDB_queue_wait': 0.0, 'InnoDB_pages_distinct': 0,
-        'Log_slow_rate_type': None, 'Log_slow_rate_limit': 0,
-        'SQL': ""
+    
+    # Initialize the template
+    entry = {'SQL': "", 'Time': None, 'User@Host': None}
+    
+    # Pattern Map for automated extraction of fields
+    patterns = {
+        'Id': r'Id:\s*(\d+)', 
+        'Schema': r'Schema:\s*(\S+)', 
+        'Last_errno': r'Last_errno:\s*(\d+)', 
+        'Killed': r'Killed:\s*(\d+)',
+        'Query_time': r'Query_time:\s*([\d.]+)', 
+        'Lock_time': r'Lock_time:\s*([\d.]+)',
+        'Rows_sent': r'Rows_sent:\s*(\d+)', 
+        'Rows_examined': r'Rows_examined:\s*(\d+)',
+        'Rows_affected': r'Rows_affected:\s*(\d+)', 
+        'Bytes_sent': r'Bytes_sent:\s*(\d+)',
+        'Tmp_tables': r'Tmp_tables:\s*(\d+)', 
+        'Tmp_disk_tables': r'Tmp_disk_tables:\s*(\d+)',
+        'QC_Hit': r'QC_Hit:\s*(\S+)', 
+        'Full_scan': r'Full_scan:\s*(\S+)',
+        'Log_slow_rate_limit': r'Log_slow_rate_limit:\s*(\d+)'
     }
-    lines = block.split('\n')
+
     sql_lines = []
-    for line in lines:
+    for line in block.split('\n'):
         line = line.strip()
         if not line: continue
-        if line.startswith('# Time:'):
+        
+        # 1. Handle the start of the block
+        if line.startswith('# Time:'): 
             entry['Time'] = line.replace('# Time:', '').strip()
+        
+        # 2. FIXED: Handle User@Host and Id correctly on the same line
         elif line.startswith('# User@Host:'):
-            u_match = re.search(r'User@Host:\s*(.*?)\s+Id:', line)
-            if u_match: entry['User@Host'] = u_match.group(1).strip()
-            id_m = re.search(r'Id:\s*(\d+)', line)
-            if id_m: entry['Id'] = int(id_m.group(1))
-        elif 'Schema:' in line:
-            m = re.search(r'Schema:\s*(\S+)', line)
-            if m: entry['Schema'] = m.group(1)
-            e = re.search(r'Last_errno:\s*(\d+)', line)
-            if e: entry['Last_errno'] = int(e.group(1))
-            k = re.search(r'Killed:\s*(\d+)', line)
-            if k: entry['Killed'] = int(k.group(1))
-        elif 'Query_time:' in line:
-            qt = re.search(r'Query_time:\s*([\d.]+)', line)
-            lt = re.search(r'Lock_time:\s*([\d.]+)', line)
-            rs = re.search(r'Rows_sent:\s*(\d+)', line)
-            re_ = re.search(r'Rows_examined:\s*(\d+)', line)
-            ra = re.search(r'Rows_affected:\s*(\d+)', line)
-            if qt: entry['Query_time'] = float(qt.group(1))
-            if lt: entry['Lock_time'] = float(lt.group(1))
-            if rs: entry['Rows_sent'] = int(rs.group(1))
-            if re_: entry['Rows_examined'] = int(re_.group(1))
-            if ra: entry['Rows_affected'] = int(ra.group(1))
-        elif 'Bytes_sent:' in line:
-            bs = re.search(r'Bytes_sent:\s*(\d+)', line)
-            if bs: entry['Bytes_sent'] = int(bs.group(1))
-            tt = re.search(r'Tmp_tables:\s*(\d+)', line)
-            if tt: entry['Tmp_tables'] = int(tt.group(1))
-            td = re.search(r'Tmp_disk_tables:\s*(\d+)', line)
-            if td: entry['Tmp_disk_tables'] = int(td.group(1))
-            ts = re.search(r'Tmp_table_sizes:\s*(\d+)', line)
-            if ts: entry['Tmp_table_sizes'] = int(ts.group(1))
-        elif 'QC_Hit:' in line:
-            for key in ['QC_Hit', 'Full_scan', 'Full_join', 'Tmp_table', 'Tmp_table_on_disk']:
-                m = re.search(f'{key}:\\s*(\\S+)', line)
-                if m: entry[key] = m.group(1)
-        elif 'Filesort:' in line:
-            for key in ['Filesort', 'Filesort_on_disk', 'Merge_passes']:
-                m = re.search(f'{key}:\\s*(\\S+)', line)
-                if m:
-                    val = m.group(1)
-                    entry[key] = int(val) if val.isdigit() else val
-        elif 'InnoDB_' in line:
-            innodb_keys = ['InnoDB_IO_r_ops', 'InnoDB_IO_r_bytes', 'InnoDB_IO_r_wait', 'InnoDB_rec_lock_wait', 'InnoDB_queue_wait', 'InnoDB_pages_distinct']
-            for key in innodb_keys:
-                match = re.search(f'{key}:\\s*([\\d.]+)', line)
+            # Extract User info but STOP before 'Id:' (using lookahead)
+            u_match = re.search(r'User@Host:\s*(.*?)(?=\s+Id:|$)', line)
+            if u_match:
+                entry['User@Host'] = u_match.group(1).strip()
+            
+            # Extract Id from this same line
+            id_match = re.search(r'Id:\s*(\d+)', line)
+            if id_match:
+                entry['Id'] = int(id_match.group(1))
+        
+        # 3. Handle all other metrics in comment lines
+        elif line.startswith('#'):
+            for key, pat in patterns.items():
+                if key in entry and entry[key] is not None: continue # Skip if already found (like Id)
+                match = re.search(pat, line)
                 if match:
                     val = match.group(1)
-                    entry[key] = float(val) if '.' in val else int(val)
-        elif 'Log_slow_rate' in line:
-            m = re.search(r'Log_slow_rate_type:\s*(\S+)', line)
-            if m: entry['Log_slow_rate_type'] = m.group(1)
-            m = re.search(r'Log_slow_rate_limit:\s*(\d+)', line)
-            if m: entry['Log_slow_rate_limit'] = int(m.group(1))
-        elif not line.startswith('#'):
-            if not (line.startswith('use ') or line.startswith('SET timestamp=')):
+                    entry[key] = float(val) if '.' in val else (int(val) if val.isdigit() else val)
+            
+            # Special check for InnoDB fields (flattened to top level)
+            if 'InnoDB_' in line:
+                for k in ['IO_r_ops', 'IO_r_bytes', 'IO_r_wait', 'rec_lock_wait', 'queue_wait', 'pages_distinct']:
+                    m = re.search(f'InnoDB_{k}:\\s*([\\d.]+)', line)
+                    if m: entry[f'InnoDB_{k}'] = float(m.group(1)) if '.' in m.group(1) else int(m.group(1))
+        
+        # 4. Handle SQL lines (exclude metadata)
+        else:
+            if not any(line.startswith(x) for x in ['use ', 'SET timestamp=']):
                 sql_lines.append(line)
+
     entry['SQL'] = " ".join(sql_lines).strip()
     return entry
 
-# --- 4. THE TRACKING TAIL LOGIC ---
-def tail_slow_log(filepath, output_json):
-    print(f"Monitoring {filepath}... Outputting to {output_json}")
+def output_data(entry, output_json):
+    """Sends the result to the local JSON file and Elasticsearch"""
+    if not entry: return
+    data = json.dumps(entry, cls=PreciseEncoder)
     
-    # Handle initial file identification
-    file_info = os.stat(filepath)
-    current_inode = file_info.st_ino
-    state = get_last_state()
+    # Save to file (Append mode)
+    with open(output_json, 'a') as f: 
+        f.write(data + "\n")
     
-    # Decide where to start based on the "bookmark"
-    if state["inode"] == current_inode:
-        last_pos = state["pos"]
-        print(f"Resuming from saved position: {last_pos}")
-    else:
-        last_pos = 0
-        print("New log file or rotation detected. Starting from zero.")
+    # Send to Elasticsearch (Ignore errors to keep the parser running)
+    try: 
+        requests.post(ES_URL, data=data, headers={'Content-Type':'application/json'}, timeout=2)
+    except: 
+        pass 
 
-    with open(filepath, 'r') as f:
-        f.seek(last_pos)
-        current_block = []
-
+# --- THE TAIL LOGIC ---
+def tail_log(log_path, out_json):
+    """Main loop: resumes from bookmark, handles rotations, and tails new lines"""
+    # Load last bookmark (Inode and Byte Position)
+    st = json.load(open(STATE_FILE)) if os.path.exists(STATE_FILE) else {"inode": 0, "pos": 0}
+    curr_inode = os.stat(log_path).st_ino
+    pos = st['pos'] if st['inode'] == curr_inode else 0
+    
+    with open(log_path, 'r') as f:
+        f.seek(pos)
+        block = []
         while True:
-            # Check for rotation while running
-            if os.stat(filepath).st_ino != current_inode:
-                print("Log file rotated! Saving and restarting...")
-                save_state(current_inode, f.tell())
+            # Check if file changed on disk (Logrotate support)
+            if os.stat(log_path).st_ino != curr_inode: 
                 break 
-
+            
             line = f.readline()
             
+            # If end of file reached
             if not line:
-                # Save position frequently even when quiet
-                save_state(current_inode, f.tell())
-                
-                # Flush logic for manual pastes/end of file
-                if current_block:
-                    entry = parse_query_block("\n".join(current_block))
-                    if entry:
-                        with open(output_json, 'a') as out:
-                            out.write(json.dumps(entry, cls=PreciseJSONEncoder) + "\n")
-                    current_block = []
-                
+                # EOF Flush: process any query sitting in the buffer
+                if block: 
+                    output_data(parse_query_block("\n".join(block)), out_json)
+                    block = []
+                # Save position state
+                with open(STATE_FILE, 'w') as sf: 
+                    json.dump({"inode": curr_inode, "pos": f.tell()}, sf)
                 time.sleep(0.1)
                 continue
-
-            # Detect new query block
-            if line.startswith('# Time:') and current_block:
-                entry = parse_query_block("\n".join(current_block))
-                if entry:
-                    with open(output_json, 'a') as out:
-                        out.write(json.dumps(entry, cls=PreciseJSONEncoder) + "\n")
-                    save_state(current_inode, f.tell()) # Update bookmark
-                current_block = []
             
-            current_block.append(line)
+            # If a new query begins, process the old one
+            if line.startswith('# Time:') and block:
+                output_data(parse_query_block("\n".join(block)), out_json)
+                block = []
+            
+            block.append(line)
 
-# --- 5. RUN ---
 if __name__ == "__main__":
-    LOG_FILE = "/home/tadas/Dev/SQL-parser/log.txt"
-    OUT_FILE = "/home/tadas/Dev/SQL-parser/output.json"
-    try:
-        # We wrap this in a loop to handle the 'break' when rotation occurs
-        while True:
-            tail_slow_log(LOG_FILE, OUT_FILE)
-            time.sleep(1) # Short wait before re-opening rotated file
-    except KeyboardInterrupt:
-        print("\nStopping...")
+    L, O = "/home/tadas/Dev/SQL-parser/log.txt", "/home/tadas/Dev/SQL-parser/output.json"
+    print(f"Agent started. Monitoring {L}...")
+    while True:
+        try: 
+            tail_log(L, O)
+        except KeyboardInterrupt: 
+            print("\nShutting down...")
+            break
+        except Exception as e: 
+            # Re-try in case of file locks during rotation
+            time.sleep(1)
